@@ -18,10 +18,11 @@ ORANGE_PS3=$'\e[0;33m'
 WHITE='\033[0;37m'
 
 proxy=(
-  "gcr.azk8s.cn/google_containers"
+  "gcr.lework.workers.dev/google-containers"
   "registry.aliyuncs.com/google_containers"
   "gcrxio"
 )
+
 images=(
   "k8s.gcr.io/kube-apiserver:"
   "k8s.gcr.io/kube-controller-manager:"
@@ -83,7 +84,7 @@ function usage {
     echo
     echo
     echo "Example:"
-    echo "  $0 gcr.io/google_containers/pause-amd64:3.1"
+    echo "  $0 gcr.io/google-containers/pause-amd64:3.1"
     echo "  $0 \"k8s.gcr.io/kube-{apiserver,controller-manager,proxy,scheduler}:v1.14.3\""
     echo "  $0 -i k8s.gcr.io/pause-amd64:3.1"
     echo "  $0 -p registry.aliyuncs.com/google_containers -i k8s.gcr.io/pause-amd64:3.1"

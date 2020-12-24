@@ -1,6 +1,15 @@
 #!/bin/bash
 
 
+get_addr () {
+    local if_name=$1
+    local uri_template=$2
+    ip addr show dev $if_name | awk -v uri=$uri_template '/\s*inet\s/ { \
+      ip=gensub(/(.+)\/.+/, "\\1", "g", $2); \
+      print gensub(/^(.+:\/\/).+(:.+)$/, "\\1" ip "\\2", "g", uri); \
+      exit}'
+}
+
 # converts IPv4 as "A.B.C.D" to integer
 ip4_to_int() {
   IFS=. read -r i j k l <<EOF

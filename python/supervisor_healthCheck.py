@@ -1,12 +1,14 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
 
-# @Time    : 2019-11-25
+# @Time    : 2020-06-05
 # @Author  : lework
 # @Desc    : 针对supervisor的应用进行健康检查
+# @Version : 1.6
 
 
 import os
+import re
 import sys
 import time
 import json
@@ -88,62 +90,66 @@ def get_proc_cpu(pid):
         return None
     return cpu_utilization
 
-
-def get_proc_rss(pid, cumulative=False):
+def get_proc_mem(pid, type="rss"):
     """
     获取进程内存使用
     :param pid:
-    :param cumulative:
+    :param type:
     :return:
     """
-    pscommand = 'ps -orss= -p %s'
-    pstreecommand = 'ps ax -o "pid= ppid= rss="'
-    ProcInfo = namedtuple('ProcInfo', ['pid', 'ppid', 'rss'])
 
-    def find_children(parent_pid, procs):
-        # 找出进程的子进程信息
-        children = []
-        for proc in procs:
-            pid, ppid, rss = proc
-            if ppid == parent_pid:
-                children.append(proc)
-                children.extend(find_children(pid, procs))
-        return children
+    smaps_file = "/proc/%s/smaps" % pid
+    smaps_data = ""
+    if not os.path.exists(smaps_file):
+        print("[Error] not found %s" % smaps_file)
+        return None
 
-    if cumulative:
-        # 统计进程的子进程rss
-        _, data, _ = shell(pstreecommand)
-        data = data.strip()
+    try:
+        with open("/proc/%s/smaps" % (pid)) as f:
+            smaps_data = f.read().strip()
+    except Exception as e:
+        print("[Error] %s" % e)
+        return None
 
-        procs = []
-        for line in data.splitlines():
-            p_pid, p_ppid, p_rss = map(int, line.split())
-            procs.append(ProcInfo(pid=p_pid, ppid=p_ppid, rss=p_rss))
+    if type == "rss":
+        rss_re = re.compile(br"\nRss\:\s+(\d+)")
+        data = sum(map(int, rss_re.findall(smaps_data)))
+    elif type == "pss":
+        pss_re = re.compile(br"\nPss\:\s+(\d+)")
+        data = sum(map(int, pss_re.findall(smaps_data)))
+    elif type == "uss":
+        private_re = re.compile(br"\nPrivate.*:\s+(\d+)")
+        data = sum(map(int, private_re.findall(smaps_data)))
 
-        # 计算rss
+    data = data / 1024  # rss 的单位是 KB， 这里返回MB单位
+    return data
+
+
+class WorkerThread(threading.Thread):
+    """
+    自定义Thread，记录线程的异常信息
+    """
+
+    def __init__(self, target=None, args=(), kwargs={}, name=None):
+        super(WorkerThread, self).__init__(target=target, args=args, kwargs=kwargs, name=name)
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs
+
+        self.exception = None
+
+    def run(self):
         try:
-            parent_proc = [p for p in procs if p.pid == pid][0]
-            children = find_children(pid, procs)
-            tree = [parent_proc] + children
-            rss = sum(map(int, [p.rss for p in tree]))
-        except (ValueError, IndexError):
-            # 计算错误时，返回None
-            return None
+            if self._target:
+                self._target(*self._args, **self._kwargs)
+        except Exception as e:
+            # 记录线程异常
+            self.exception = sys.exc_info()
+        finally:
+            del self._target, self._args, self._kwargs
 
-    else:
-        _, data, _ = shell(pscommand % pid)
-        if not data:
-            # 未获取到数据值，或者没有此pid信息
-            return None
-        try:
-            rss = data.strip()
-            rss = int(rss)
-        except ValueError:
-            # 获取的结果不包含数据，或者无法识别rss
-            return None
-
-    rss = rss / 1024  # rss 的单位是 KB， 这里返回MB单位
-    return rss
+    def get_exception(self):
+        return self.exception
 
 
 class HealthCheck(object):
@@ -155,11 +161,13 @@ class HealthCheck(object):
 
         self.mail_config = None
         self.wechat_config = None
+        self.dingding_config = None
         self.supervisord_url = 'unix:///var/run/supervisor.sock'
 
         if 'config' in config:
             self.mail_config = config['config'].get('mail')
             self.wechat_config = config['config'].get('wechat')
+            self.dingding_config = config['config'].get('dingding')
             self.supervisord_url = config['config'].get('supervisordUrl', self.supervisord_url)
             self.supervisord_user = config['config'].get('supervisordUser', None)
             self.supervisord_pass = config['config'].get('supervisordPass', None)
@@ -167,14 +175,17 @@ class HealthCheck(object):
 
         self.program_config = config
 
+        # 只保留通知action
+        self.notice_action = ['email', 'wechat', 'dingding']
+
         self.periodSeconds = 5
         self.failureThreshold = 3
         self.successThreshold = 1
         self.initialDelaySeconds = 1
         self.sendResolved = False
 
-        self.max_rss = 1024
-        self.cumulative = False
+        self.mem_type = 'rss'
+        self.max_mem = 1024
         self.max_cpu = 90
 
     def get_supervisord_conn(self):
@@ -199,6 +210,7 @@ class HealthCheck(object):
         err = ''
 
         if kind == 'supervisor':
+            # 通过supervisor程序获取pid
             try:
                 s = self.get_supervisord_conn()
                 info = s.supervisor.getProcessInfo(program)
@@ -206,8 +218,10 @@ class HealthCheck(object):
                 err = info.get('description')
             except Exception as e:
                 self.log(program, "PID: Can't get pid from supervisor %s ", e)
+
         elif kind == 'name':
-            pscommand = "ps -A -o pid,cmd |grep '[%s]%s' | awk '{print $1}' | head -1"
+            # 通过进程名称获取pid
+            pscommand = "ps -A -o pid,cmd | grep '[%s]%s' | awk '{print $1}' | head -1"
             exitcode, stdout, stderr = shell(pscommand % (program[0], program[1:]))
             if exitcode == 0:
                 pid = stdout.strip()
@@ -217,6 +231,7 @@ class HealthCheck(object):
                 err = stderr
 
         elif kind == 'file':
+            # 通过文件获取pid
             if pid_file:
                 try:
                     with open(pid_file) as f:
@@ -225,8 +240,9 @@ class HealthCheck(object):
                     self.log(program, "PID: Can't get pid from file %s ", e)
                     err = "Can't get pid from file"
             else:
-                err = "PID: pid file not set"
+                err = "PID: pid file not set."
                 self.log(program, err)
+
         if not pid:
             pid = 0
 
@@ -255,18 +271,20 @@ class HealthCheck(object):
         :return:
         """
         check_state = {}
+
         program = config.get('program')
         periodSeconds = config.get('periodSeconds', self.periodSeconds)
         failureThreshold = config.get('failureThreshold', self.failureThreshold)
         successThreshold = config.get('successThreshold', self.successThreshold)
         initialDelaySeconds = config.get('initialDelaySeconds', self.initialDelaySeconds)
         sendResolved = config.get('sendResolved', self.sendResolved)
+
         action_type = config.get('action', 'restart')
+        check_type = config.get('type', 'http').lower()
 
-        check_type = config.get('type', 'HTTP').lower()
-        check_method = self.http_check
-
-        if check_type == 'tcp':
+        if check_type == 'http':
+            check_method = self.http_check
+        elif check_type == 'tcp':
             check_method = self.tcp_check
         elif check_type == 'mem':
             check_method = self.mem_check
@@ -281,7 +299,7 @@ class HealthCheck(object):
                     'success': 0,
                     'action': False
                 }
-                self.log(program, 'CONFIG: %s', config)
+                self.log(program, '[CONFIG]: %s', config)
                 time.sleep(initialDelaySeconds)
 
             # self.log(program, '%s check state: %s', check_type, json.dumps(check_state[program]))
@@ -289,7 +307,7 @@ class HealthCheck(object):
                 check_result = check_method(config)
                 check_status = check_result.get('status', None)
                 check_info = check_result.get('info', '')
-                self.log(program, '%s check: info(%s) state(%s)', check_type.upper(), check_info, check_status)
+                self.log(program, '[%s check]: info(%s) state(%s)', check_type.upper(), check_info, check_status)
 
                 if check_status == 'failure':
                     check_state[program]['failure'] += 1
@@ -300,10 +318,8 @@ class HealthCheck(object):
                 if check_state[program]['success'] >= successThreshold:
                     # 只有开启恢复通知和检测失败并且执行操作后,才可以发送恢复通知
                     if sendResolved and check_state[program]['action']:
-                        # 只保留通知action
-                        notice_action = ['email', 'wechat']
-                        send_action = ','.join(list(set(action_type.split(',')) & set(notice_action)))
-                        self.log(program, 'Use %s send resolved.', send_action)
+                        send_action = ','.join(list(set(action_type.split(',')) & set(self.notice_action)))
+                        self.log(program, '[Resolved] Use %s.', send_action)
                         action_param = {
                             'check_status': check_status,
                             'action_type': send_action,
@@ -323,7 +339,7 @@ class HealthCheck(object):
                             check_state[program]['failure'] != 0 and check_state[program]['failure'] % (
                             (periodSeconds + initialDelaySeconds) * 2) == 0):
                         action_param = {
-						    'config': config,
+                            'config': config,
                             'action_type': action_type,
                             'check_status': check_status,
                             'msg': check_result.get('msg', '')
@@ -364,7 +380,7 @@ class HealthCheck(object):
             try:
                 headers.update(json.loads(config_hearders))
             except Exception as e:
-                self.log(program, 'HTTP: config_headers not loads: %s , %s', config_hearders, e)
+                self.log(program, '[http_check]: config_headers not loads: %s , %s', config_hearders, e)
             if config_json:
                 headers['Content-Type'] = 'application/json'
 
@@ -376,7 +392,7 @@ class HealthCheck(object):
             try:
                 config_body = json.dumps(config_json)
             except Exception as e:
-                self.log(program, 'HTTP: config_json not loads: %s , %s', json, e)
+                self.log(program, '[http_check]: config_json not loads: %s , %s', json, e)
 
         check_info = '%s %s %s %s %s %s' % (config_host, config_port, config_path, config_method,
                                             config_body, headers)
@@ -386,7 +402,7 @@ class HealthCheck(object):
             httpClient.request(config_method, config_path, config_body, headers=headers)
             res = httpClient.getresponse()
         except Exception as e:
-            self.log(program, 'HTTP: conn error, %s', e)
+            self.log(program, '[http_check]: conn error, %s', e)
             return {'status': 'failure', 'msg': '[http_check] %s' % e, 'info': check_info}
         finally:
             if httpClient:
@@ -414,7 +430,7 @@ class HealthCheck(object):
             sock.connect((host, port))
             sock.close()
         except Exception as e:
-            self.log(program, 'TCP: conn error, %s', e)
+            self.log(program, '[tcp_check]: conn error, %s', e)
             return {'status': 'failure', 'msg': '[tcp_check] %s' % e, 'info': check_info}
         return {'status': 'success', 'msg': '[tcp_check] connection succeeded', 'info': check_info}
 
@@ -425,25 +441,25 @@ class HealthCheck(object):
         :return: dict
         """
         program = config.get('program')
-        max_rss = config.get('maxRss', self.max_rss)
-        cumulative = config.get('cumulative', self.cumulative)
+        max_mem = config.get('maxMem', self.max_mem)
+        mem_type = config.get('memType', self.mem_type)
         pid_get = config.get('pidGet', 'supervisor')
         pid_file = config.get('pidFile', )
-        check_info = 'max_rss:%sMB cumulative:%s' % (max_rss, cumulative)
+        check_info = 'max_mem:%sMB mem_type:%s' % (max_mem, mem_type)
 
         pid, err = self.get_pid(program, pid_get, pid_file)
         if pid == 0:
-            self.log(program, 'MEM: check error, program not starting')
+            self.log(program, '[mem_check]: check error, program not starting.')
             return {'status': 'failure',
-                    'msg': '[mem_check] program not starting, message: %s' % err,
+                    'msg': '[mem_check] program not starting, message: %s.' % err,
                     'info': check_info}
-        now_rss = get_proc_rss(pid, cumulative)
-        check_info = '%s now_rss:%sMB pid:%s' % (check_info, now_rss, pid)
-        if now_rss >= int(max_rss):
-            return {'status': 'failure', 'msg': '[mem_check] max_rss(%sMB) now_rss(%sMB)' % (max_rss, now_rss),
+        now_mem = get_proc_mem(pid, mem_type)
+        check_info = '%s now_mem:%sMB pid:%s' % (check_info, now_mem, pid)
+        if now_mem >= int(max_mem):
+            return {'status': 'failure', 'msg': '[mem_check] max_mem(%sMB) now_mem(%sMB)' % (max_mem, now_mem),
                     'info': check_info}
 
-        return {'status': 'success', 'msg': '[mem_check] max_rss(%sMB) now_rss(%sMB)' % (max_rss, now_rss),
+        return {'status': 'success', 'msg': '[mem_check] max_mem(%sMB) now_mem(%sMB)' % (max_mem, now_mem),
                 'info': check_info}
 
     def cpu_check(self, config):
@@ -460,9 +476,9 @@ class HealthCheck(object):
 
         pid, err = self.get_pid(program, pid_get, pid_file)
         if pid == 0:
-            self.log(program, 'CPU: check error, program not starting')
+            self.log(program, '[cpu_check]: check error, program not starting.')
             return {'status': 'failure',
-                    'msg': '[cpu_check] program not starting, message: %s' % err,
+                    'msg': '[cpu_check] program not starting, message: %s.' % err,
                     'info': check_info}
         now_cpu = get_proc_cpu(pid)
         check_info = '{info} now_cpu:{now}% pid:{pid}'.format(info=check_info, now=now_cpu, pid=pid)
@@ -486,8 +502,8 @@ class HealthCheck(object):
         msg = args.get('msg')
         check_status = args.get('check_status')
         config = args.get('config')
-		
-        self.log(program, 'Action: %s', action_type)
+
+        self.log(program, '[Action: %s]', action_type)
         action_list = action_type.split(',')
 
         if 'restart' in action_list:
@@ -508,6 +524,8 @@ class HealthCheck(object):
             self.action_email(program, action_type, msg, check_status)
         if 'wechat' in action_list and self.wechat_config:
             self.action_wechat(program, action_type, msg, check_status)
+        if 'dingding' in action_list and self.dingding_config:
+            self.action_dingding(program, action_type, msg, check_status)
 
     def action_supervisor_restart(self, program):
         """
@@ -515,38 +533,35 @@ class HealthCheck(object):
         :param program:
         :return:
         """
-        self.log(program, 'Action: restart')
         result = 'success'
         try:
             s = self.get_supervisord_conn()
             info = s.supervisor.getProcessInfo(program)
         except Exception as e:
             result = 'Get %s ProcessInfo Error: %s' % (program, e)
-            self.log(program, 'Action: restart %s' % result)
+            self.log(program, '[Action: restart] %s' % result)
             return result
 
         if info['state'] == 20:
-            self.log(program, 'Action: restart stop process')
             try:
                 stop_result = s.supervisor.stopProcess(program)
-                self.log(program, 'Action: restart stop result %s', stop_result)
+                self.log(program, '[Action: restart] stop result %s', stop_result)
             except Fault as e:
                 result = 'Failed to stop process %s, exiting: %s' % (program, e)
-                self.log(program, 'Action: restart stop error %s', result)
+                self.log(program, '[Action: restart] stop error %s', result)
                 return result
 
             time.sleep(1)
             info = s.supervisor.getProcessInfo(program)
 
         if info['state'] != 20:
-            self.log(program, 'Action: restart start process')
             try:
                 start_result = s.supervisor.startProcess(program)
+                self.log(program, '[Action: restart] start result %s', start_result)
             except Fault as e:
                 result = 'Failed to start process %s, exiting: %s' % (program, e)
-                self.log(program, 'Action: restart start error %s', result)
+                self.log(program, '[Action: restart] start error %s', result)
                 return result
-            self.log(program, 'Action: restart start result %s', start_result)
 
         return result
 
@@ -557,19 +572,18 @@ class HealthCheck(object):
         :param cmd:
         :return:
         """
-        self.log(program, 'Action: exec')
         result = 'success'
 
         exitcode, stdout, stderr = shell(cmd)
 
         if exitcode == 0:
-            self.log(program, "Action: exec result success")
+            self.log(program, "[Action: exec] result success")
         else:
             result = 'Failed to exec %s, exiting: %s' % (program, exitcode)
-            self.log(program, "Action: exec result %s", result)
+            self.log(program, "[Action: exec] result %s", result)
 
         return result
-		
+
     def action_kill(self, program, pid):
         """
         杀死进程
@@ -577,20 +591,19 @@ class HealthCheck(object):
         :param pid:
         :return:
         """
-        self.log(program, 'Action: kill')
         result = 'success'
-		
+
         if int(pid) < 3:
-            return 'Failed to kill %s, pid: %s '% (program, exitcode)
-		  
+            return 'Failed to kill %s, pid: %s ' % (program, pid)
+
         cmd = "kill -9 %s" % pid
         exitcode, stdout, stderr = shell(cmd)
 
         if exitcode == 0:
-            self.log(program, "Action: kill result success")
+            self.log(program, "[Action: kill] result success")
         else:
             result = 'Failed to kill %s, pid: %s exiting: %s' % (program, pid, exitcode)
-            self.log(program, "Action: kill result %s", result)
+            self.log(program, "[Action: kill] result %s", result)
 
         return result
 
@@ -603,7 +616,6 @@ class HealthCheck(object):
         :param check_status:
         :return:
         """
-        self.log(program, 'Action: email')
 
         ip = ""
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -611,7 +623,7 @@ class HealthCheck(object):
             s.connect(('8.8.8.8', 80))
             ip = s.getsockname()[0]
         except Exception as e:
-            self.log(program, 'Action: email get ip error %s' % e)
+            self.log(program, '[Action: email] get ip error %s' % e)
         finally:
             s.close()
 
@@ -649,10 +661,10 @@ class HealthCheck(object):
             s.sendmail(mail_user, to_list, msg.as_string())
             s.quit()
         except Exception as e:
-            self.log(program, 'Action: email send error %s' % e)
+            self.log(program, '[Action: email] send error %s' % e)
             return False
 
-        self.log(program, 'Action: email send success.')
+        self.log(program, '[Action: email] send success.')
         return True
 
     def action_wechat(self, program, action_type, msg, check_status):
@@ -664,8 +676,6 @@ class HealthCheck(object):
         :param check_status:
         :return:
         """
-        self.log(program, 'Action: wechat')
-
         host = "qyapi.weixin.qq.com"
 
         corpid = self.wechat_config.get('corpid')
@@ -686,7 +696,7 @@ class HealthCheck(object):
             response = httpClient.getresponse()
             token = json.loads(response.read())['access_token']
         except Exception as e:
-            self.log(program, 'Action: wechat get token error %s' % e)
+            self.log(program, '[Action: wechat] get token error %s' % e)
             return False
         finally:
             if httpClient:
@@ -700,7 +710,7 @@ class HealthCheck(object):
             s.connect(('8.8.8.8', 80))
             ip = s.getsockname()[0]
         except Exception as e:
-            self.log(program, 'Action: wechat get ip error %s' % e)
+            self.log(program, '[Action: wechat] get ip error %s' % e)
         finally:
             s.close()
 
@@ -745,16 +755,61 @@ class HealthCheck(object):
             response = httpClient.getresponse()
             result = json.loads(response.read())
             if result['errcode'] != 0:
-                self.log(program, 'Action: wechat send faild %s' % result)
+                self.log(program, '[Action: wechat] send faild %s' % result)
                 return False
         except Exception as e:
-            self.log(program, 'Action: wechat send error %s' % e)
+            self.log(program, '[Action: wechat] send error %s' % e)
             return False
         finally:
             if httpClient:
                 httpClient.close()
 
-        self.log(program, 'Action: wechat send success')
+        self.log(program, '[Action: wechat] send success')
+        return True
+
+    def action_dingding(self, program, action_type, msg, check_status):
+        curr_dt = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        hostname = platform.node().split('.')[0]
+        system_platform = platform.platform()
+
+        host = "oapi.dingtalk.com"
+        access_token = self.dingding_config.get('access_token')
+        send_url = '/robot/send?access_token={access_token}'.format(access_token=access_token)
+
+        headers = {
+            'Content-Type': 'application/json'
+        }
+
+        if check_status == 'success':
+            title = "[%s] Health check successful" % program
+        else:
+            title = "[%s] Health check failed" % program
+
+        data = {"msgtype": "markdown",
+                     "markdown": {
+                         "title": title,
+                         "text": "#### 详情信息: \n> Program：%s \n\n> DataTime: %s \n\n> Hostname: %s \n\n> Platfrom: %s \n\n> Msg：%s" % (
+                         program, curr_dt, hostname, system_platform, msg)
+                     }
+                     }
+
+        try:
+            httpClient = httplib.HTTPSConnection(host, timeout=10)
+            httpClient.request("POST", send_url, json.dumps(data), headers=headers)
+            response = httpClient.getresponse()
+            result = json.loads(response.read())
+            if result['errcode'] != 0:
+                self.log(program, '[Action: dingding] send faild %s' % result)
+                return False
+        except Exception as e:
+            self.log(program, '[Action: dingding] send error %s' % e)
+            return False
+        finally:
+            if httpClient:
+                httpClient.close()
+
+        self.log(program, '[Action: dingding] send success')
         return True
 
     def start(self):
@@ -762,20 +817,32 @@ class HealthCheck(object):
         启动检测
         :return:
         """
-        self.log('healthCheck:', 'start')
+        self.log('healthCheck', 'start')
         threads = []
+        threads_data = {}
 
         for key, value in iteritems(self.program_config):
             item = value
             item['program'] = key
-            t = threading.Thread(target=self.check, args=(item,))
+            t = WorkerThread(target=self.check, args=(item,), name=key)
             threads.append(t)
+            threads_data[key] = item
+
         for t in threads:
             t.setDaemon(True)
             t.start()
 
         while 1:
             time.sleep(0.1)
+            for i, t in enumerate(threads):
+                if not t.isAlive():
+                    thread_name = t.getName()
+                    self.log('ERROR', 'Exception in %s (catch by main): %s' % (thread_name, t.get_exception()))
+                    self.log('ERROR', 'Create new Thread!')
+                    t = WorkerThread(target=self.check, args=(threads_data[thread_name],), name=thread_name)
+                    t.setDaemon(True)
+                    t.start()
+                    threads[i] = t
 
 
 if __name__ == '__main__':
@@ -784,6 +851,7 @@ if __name__ == '__main__':
     def sig_handler(signum, frame):
         print("Exit check!")
         sys.exit(0)
+
 
     signal.signal(signal.SIGINT, sig_handler)
     signal.signal(signal.SIGTERM, sig_handler)
@@ -797,7 +865,7 @@ config:                                          # 脚本配置名称,请勿更�
 #  supervisordUrl: http://localhost:9001/RPC2    # supervisor的接口地址, 默认使用本地socket文件unix:///var/run/supervisor.sock
 #  supervisordUser: user                         # supervisor中设置的username, 没有设置可不填
 #  supervisordPass: pass                         # supervisor中设置的password, 没有设置可不填
-#  mail:                                         # stmp配置
+#  mail:                                         # 邮箱通知配置
 #    host: 'smtp.test.com'
 #    port': '465'
 #    user': 'ops@test.com'
@@ -810,12 +878,14 @@ config:                                          # 脚本配置名称,请勿更�
 #    touser: 
 #    toparty: 
 #    totag: 
+#  dingding:                                     # 钉钉通知配置
+     access_token:
 
 # 内存方式监控
 cat1:                     # supervisor中配置的program名称
   type: mem               # 检查类型: http,tcp,mem,cpu  默认: http
-  maxRss: 1024            # 内存阈值, 超过则为检测失败. 单位MB, 默认: 1024
-  cumulative: True        # 是否统计子进程的内存, 默认: False
+  maxMem: 1024            # 内存阈值, 超过则为检测失败. 单位MB, 默认: 1024
+  memType: rss            # 内存使用分类：rss, pss, uss 默认：rss
   pidGet: supervisor      # 获取pid的方式: supervisor,name,file, 选择name时,按program名称搜索pid,选择file时,需指定pidFile 默认: supervisor
   pidFile: /var/run/t.pid # 指定pid文件的路径, 只在pidGet为file的时候有用
   periodSeconds: 10       # 检查的频率(以秒为单位), 默认: 5
@@ -842,7 +912,7 @@ cat2:                     # supervisor中配置的program名称
 
 # HTTP方式监控
 cat3:
-  type: HTTP
+  type: http
   mode: POST              # http动作：POST,GET 默认: GET
   host: 127.0.0.1         # 主机地址, 默认: localhost
   path: /                 # URI地址，默认: /
@@ -862,7 +932,7 @@ cat3:
 
 # TCP方式监控
 cat4:
-  type: TCP
+  type: tcp
   host: 127.0.0.1         # 主机地址, 默认: localhost
   port: 8082              # 检测端口，默认: 80
   periodSeconds: 10       # 检查的频率(以秒为单位), 默认: 5

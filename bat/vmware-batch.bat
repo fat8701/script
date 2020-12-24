@@ -9,17 +9,27 @@ IF EXIST "%PROGRAMFILES(X86)%\VMWare\VMWare Workstation\vmrun.exe" SET VMwarePat
 IF EXIST "%PROGRAMFILES%\VMware\VMware VIX\vmrun.exe" SET VMwarePath=%PROGRAMFILES%\VMware\VMware VIX
 IF EXIST "%PROGRAMFILES(X86)%\VMware\VMware VIX\vmrun.exe" SET VMRUN=%PROGRAMFILES(X86)%\VMware\VMware VIX
 
-::变量设置
-::set VMwarePath="C:\Program Files (x86)\VMware\VMware Workstation"
+:: VMware安装地址
+# set VMwarePath="C:\Program Files (x86)\VMware\VMware Workstation"
+:: 虚拟机存放目录
 set VMpath="D:\Virtual Machines"
-set VMname=CentOS_7.4_x64_node
+:: 虚拟机名称
+set VMname=CentOS_7.8_x64_node
+:: 虚拟机快照名称
 set VMSnapshot=init
+:: 新建虚拟机数目
 set VMcount=5
-set VMowa="D:\vmware owa\CentOS_7.4_x64.ova"
+:: 虚拟机owa模板位置
+set VMowa="D:\vmware owa\CentOS_7.8_x64_base.ova"
+:: 模板系统用户名
 set VMuser=root
+:: 模板系统密码
 set VMpass=123456
-set VMipStart=10
+:: 虚拟机网络
 set VMnetwork=192.168.77
+:: 虚拟机ip开始地址
+set VMipStart=130
+
 
 
 :init
@@ -75,6 +85,7 @@ ping /n 2 127.1>nul
 set /p a=^><nul
 )
 
+cls
 goto init
 
 :oneKey
@@ -109,19 +120,22 @@ echo 创建虚拟机: !VMname!%%a
 cd OVFTool
 ovftool --name=!VMname!%%a !VMowa! !VMpath!
 cd ..
+echo.
 echo 启动虚拟机: !VMname!%%a
 vmrun -T ws start !VMpath!\!VMname!%%a\!VMname!%%a.vmx
 )
 
+echo.
 echo 设置ip:
 for /l %%a in (1,1,%VMcount%) do (
 set name=!VMname!%%a
 set /a num=%VMipStart%+%%a-1
 set ip=!VMnetwork!.!num!
 echo !name!:!ip!
-vmrun -T ws -gu !VMuser! -gp !VMpass! runProgramInGuest !VMpath!\!name!\!name!.vmx /bin/bash -c "sudo sed -i 's/^IPADDR=.*/IPADDR=!ip!/g' /etc/sysconfig/network-scripts/ifcfg-ens33;/etc/init.d/network restart || sudo sed -i 's/^address.*$/address !ip!/g' /etc/network/interfaces;/etc/init.d/network restart" nogui
+vmrun -T ws -gu !VMuser! -gp !VMpass! runProgramInGuest !VMpath!\!name!\!name!.vmx /bin/bash -c "sudo echo 'node!num!' > /etc/hostname; sudo sed -i 's/IPADDR=.*$/IPADDR="!ip!"/g' /etc/sysconfig/network-scripts/ifcfg-e*;/etc/init.d/network restart || sudo sed -i 's/address .*$/address !ip!/g' /etc/network/interfaces;/etc/init.d/network restart" nogui
 )
 
+echo.
 echo 创建快照:
 for /l %%a in (1,1,%VMcount%) do (
 set name=!VMname!%%a
@@ -308,7 +322,7 @@ set name=!VMname!%%a
 set /a num=%VMipStart%+%%a-1
 set ip=!VMnetwork!.!num!
 echo !name!:!ip!
-vmrun -T ws -gu !VMuser! -gp !VMpass! runProgramInGuest !VMpath!\!name!\!name!.vmx /bin/bash -c "sudo sed -i 's/^IPADDR=.*/IPADDR=!ip!/g' /etc/sysconfig/network-scripts/ifcfg-ens33;/etc/init.d/network restart || sudo sed -i 's/^address.*$/address !ip!/g' /etc/network/interfaces;/etc/init.d/network restart" nogui
+vmrun -T ws -gu !VMuser! -gp !VMpass! runProgramInGuest !VMpath!\!name!\!name!.vmx /bin/bash -c "sudo sed -i 's/IPADDR=.*$/IPADDR="!ip!"/g' /etc/sysconfig/network-scripts/ifcfg-e*;/etc/init.d/network restart || sudo sed -i 's/address .*$/address !ip!/g' /etc/network/interfaces;/etc/init.d/network restart" nogui
 )
 goto wait
 
